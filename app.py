@@ -1,8 +1,7 @@
 import streamlit as st
 import requests
 import time
-import os
-from duckduckgo_search import DDGS
+import json
 
 # ================= 配置区域 =================
 # 【安全】从 Streamlit Secrets (TOML) 读取 NVIDIA API Key
@@ -14,8 +13,8 @@ except KeyError:
 
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # 模型定义
-MODEL_LLAMA = "meta/llama-3.1-405b-instruct"  # 研报专用 (最强逻辑)
-MODEL_QWEN = "qwen/qwen2.5-72b-instruct"      # 纪要/文案专用 (最强中文)
+MODEL_LLAMA = "meta/llama-3.1-405b-instruct" # 研报专用
+MODEL_QWEN = "qwen/qwen2.5-72b-instruct"    # 纪要/文案专用
 # ==========================================
 
 # --- 页面配置 ---
@@ -32,10 +31,7 @@ st.markdown("""
 .stApp { background-color: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
 h1 { color: #4f46e5; font-weight: 800; text-align: center; }
 .subtitle { text-align: center; color: #6b7280; font-size: 1.1rem; margin-bottom: 2rem; }
-.stButton>button {
-    background-color: #76b900; /* NVIDIA 绿 */
-    color: white; border-radius: 6px; font-weight: 600; border: none; width: 100%; font-size: 1.1rem;
-}
+.stButton>button { background-color: #76b900; color: white; border-radius: 6px; font-weight: 600; border: none; width: 100%; font-size: 1.1rem; }
 .stButton>button:hover { background-color: #5a8f00; box-shadow: 0 4px 6px rgba(118, 185, 0, 0.3); }
 </style>
 """, unsafe_allow_html=True)
@@ -55,18 +51,21 @@ with st.sidebar:
     st.markdown("© 2026 小景智能体科技")
     st.markdown("[联系我们要定制服务](mailto:contact@xiaojing.ai)")
 
-# --- 核心函数：联网搜索 ---
+# --- 核心函数：联网搜索 (使用 Jina AI Reader) ---
 def search_web(query, num_results=5):
-    """使用 DuckDuckGo 搜索最新新闻"""
+    """使用 Jina AI Reader 搜索最新新闻 (无需额外库)"""
+    # Jina AI 搜索接口 (免费，无需 Key)
+    url = f"https://s.jina.ai/{query}"
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=num_results))
-            if not results:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            # Jina 返回的是纯文本，我们简单截取前 2000 字作为上下文
+            text = response.text[:2000] 
+            if not text.strip():
                 return "未找到相关搜索结果。"
-            context = "以下是最新的网络搜索结果：\n\n"
-            for i, r in enumerate(results):
-                context += f"{i+1}. **{r['title']}** ({r['href']})\n{ r['body']}\n\n"
-            return context
+            return f"以下是关于 '{query}' 的最新网络资讯：\n\n{text}"
+        else:
+            return f"搜索服务暂时不可用 (状态码：{response.status_code})。"
     except Exception as e:
         return f"搜索失败：{str(e)}"
 
@@ -80,7 +79,7 @@ def call_nvidia(prompt, model, system_prompt="你是一个有用的助手。", s
     if search_query:
         with st.spinner("🌐 正在全网搜索最新资讯..."):
             search_context = search_web(search_query)
-            if "搜索失败" in search_context:
+            if "搜索失败" in search_context or "不可用" in search_context:
                 st.warning("⚠️ 联网搜索失败，将使用模型内部知识。")
                 search_context = ""
             else:
@@ -89,15 +88,16 @@ def call_nvidia(prompt, model, system_prompt="你是一个有用的助手。", s
     # 构建增强 Prompt
     if search_context:
         final_prompt = f"""
-请根据以下【最新网络资讯】回答问题。
-注意：资讯可能包含时间、地点、数据，请务必引用最新资讯中的内容，确保时效性。
-
-【最新网络资讯】:
-{search_context}
-
-【用户问题】:
-{prompt}
-"""
+        请根据以下【最新网络资讯】回答问题。
+        注意：资讯可能包含时间、地点、数据，请务必引用最新资讯中的内容，确保时效性。
+        
+        【最新网络资讯】:
+        {search_context}
+        
+        【用户问题】:
+        {prompt}
+        """
+    
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -126,7 +126,7 @@ def call_nvidia(prompt, model, system_prompt="你是一个有用的助手。", s
 
 # --- 主界面逻辑 ---
 st.title("🌐 小景智能体工作台 (NVIDIA 安全版)")
-st.markdown('<p class="subtitle">集成 DuckDuckGo 实时搜索 + Llama 3.1/Qwen 2.5 双核驱动 | 密钥已加密存储</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">集成 Jina AI 实时搜索 + Llama 3.1/Qwen 2.5 双核驱动 | 密钥已加密存储</p>', unsafe_allow_html=True)
 
 if menu == "📊 智能研报生成 (联网)":
     st.header("📊 智能研报生成器")
@@ -186,4 +186,4 @@ elif menu == "🎨 爆款文案工厂 (联网)":
 
 # --- 页脚 ---
 st.divider()
-st.markdown("<div style='text-align: center; color: #9ca3af; font-size: 0.8rem;'>Powered by XiaoJing Agent Tech | NVIDIA NIM + DuckDuckGo Search</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align: center; color: #9ca3af; font-size: 0.8rem;'>Powered by XiaoJing Agent Tech | NVIDIA NIM + Jina AI Search</div>", unsafe_allow_html=True)
