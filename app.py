@@ -4,19 +4,32 @@ import xml.etree.ElementTree as ET
 import time
 
 # ================= 配置区域 =================
+# 1. 尝试从 Secrets 读取 Key
 try:
     API_KEY = st.secrets["nvidia"]["api_key"]
+    if not API_KEY or not API_KEY.startswith("nvapi-"):
+        st.error("⚠️ 严重错误：API Key 格式不正确！")
+        st.stop()
 except KeyError:
-    st.error("⚠️ 严重错误：未在 secrets.toml 中找到 NVIDIA 密钥！")
+    st.error("⚠️ 严重错误：未在 Secrets 中找到 NVIDIA API Key。")
+    st.stop()
+except Exception as e:
+    st.error(f"⚠️ 读取配置出错：{str(e)}")
     st.stop()
 
+# 【修正】NVIDIA 官方标准接口地址
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+# 【修正】官方标准模型名称 (注意大小写和斜杠)
+# Llama 3.1 405B
 MODEL_LLAMA = "meta/llama-3.1-405b-instruct"
+# Qwen 2.5 72B
 MODEL_QWEN = "qwen/qwen2.5-72b-instruct"
+
 # ==========================================
+st.set_page_config(page_title="小景智能体 | 404 修复版", layout="wide")
 
-st.set_page_config(page_title="小景智能体 | Google News 版", layout="wide")
-
+# --- 自定义 CSS ---
 st.markdown("""
 <style>
 .stApp { background-color: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
@@ -26,6 +39,7 @@ h1 { color: #4f46e5; font-weight: 800; text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
+# --- 侧边栏 ---
 with st.sidebar:
     st.title("小景智能体")
     st.markdown("**让 AI 成为你的超级员工**")
@@ -34,45 +48,40 @@ with st.sidebar:
     st.divider()
     st.markdown("© 2026 小景智能体科技")
 
-# --- 核心函数：Google News RSS 搜索 (无需安装库) ---
+# --- 核心函数：Google News RSS ---
 def search_google_news(query, num_results=5):
-    """抓取 Google News RSS 源"""
-    # 构造 RSS  URL
     url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}+when:2d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
     try:
         response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         if response.status_code == 200:
             root = ET.fromstring(response.content)
             items = []
-            # 解析 XML
             for item in root.findall('.//item'):
                 title = item.find('title').text
                 link = item.find('link').text
-                # 有些链接是相对的，需要补全
                 if link.startswith('/'): link = "https://news.google.com" + link
                 pub_date = item.find('pubDate').text
                 items.append(f"- **{title}** ({pub_date}) [来源]({link})")
-                if len(items) >= num_results:
-                    break
-            if items:
-                return "以下是 Google News 最新实时资讯：\n\n" + "\n".join(items)
-            else:
-                return "未找到最新相关新闻。"
-        else:
-            return f"搜索服务暂时不可用 (状态码：{response.status_code})。"
-    except Exception as e:
-        return f"搜索失败：{str(e)}"
+                if len(items) >= num_results: break
+            if items: return "以下是 Google News 最新实时资讯：\n\n" + "\n".join(items)
+            else: return "未找到最新相关新闻。"
+        else: return f"搜索服务暂时不可用 (状态码：{response.status_code})。"
+    except Exception as e: return f"搜索失败：{str(e)}"
 
-# --- 核心函数：调用 NVIDIA AI ---
+# --- 核心函数：调用 NVIDIA AI (增强 404 调试) ---
 def call_nvidia(prompt, model, system_prompt="你是一个有用的助手。", search_context=None):
-    if search_context:
-        final_prompt = f"请根据以下【最新实时资讯】回答问题，务必体现时效性。\n\n【最新资讯】:\n{search_context}\n\n【用户问题】:\n{prompt}"
+    if search_context and search_context != "未找到最新相关新闻。":
+        final_prompt = f"请根据以下【最新实时资讯】回答问题。\n\n【最新资讯】:\n{search_context}\n\n【用户问题】:\n{prompt}"
     else:
         final_prompt = prompt
 
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
     payload = {
-        "model": model,
+        "model": model,  # 使用传入的模型名称
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": final_prompt}
@@ -80,22 +89,32 @@ def call_nvidia(prompt, model, system_prompt="你是一个有用的助手。", s
         "max_tokens": 1024,
         "temperature": 0.7
     }
+
     try:
         response = requests.post(BASE_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
+        elif response.status_code == 404:
+            # 【关键修复】404 详细信息
+            return f"❌ 请求的资源不存在 (404)。\n可能原因：模型名称 '{model}' 错误或接口地址错误。\n原始信息：{response.text}"
+        elif response.status_code == 401:
+            return f"❌ 认证失败 (401)：API Key 无效。\n原始信息：{response.text}"
+        elif response.status_code == 429:
+            return f"⚠️ 请求过快 (429)。\n原始信息：{response.text}"
+        elif response.status_code == 503:
+            return f"⚠️ 服务不可用 (503)。\n原始信息：{response.text}"
         else:
-            return f"❌ AI 服务繁忙 ({response.status_code})。"
+            return f"❌ 服务繁忙 ({response.status_code})。\n原始信息：{response.text}"
     except Exception as e:
-        return f"❌ 请求失败：{str(e)}"
+        return f"❌ 网络请求失败：{str(e)}"
 
 # --- 主界面 ---
-st.title("🌐 小景智能体 (Google News 实时版)")
-st.markdown('<p class="subtitle">集成 Google News 实时 RSS + Llama 3.1/Qwen 2.5</p>', unsafe_allow_html=True)
+st.title("🌐 小景智能体 (404 修复版)")
+st.markdown('<p class="subtitle">修正模型名称与接口地址</p>', unsafe_allow_html=True)
 
 if menu == "📊 智能研报 (Google News)":
     st.header("📊 智能研报生成器")
-    st.info("💡 **已开启 Google News 实时搜索**：自动获取过去 48 小时最新新闻。")
+    st.info("💡 **已开启 Google News 实时搜索**")
     topic = st.text_input("请输入行业或主题")
     if st.button("🚀 开始生成研报"):
         if not topic: st.warning("请输入主题！")
@@ -103,17 +122,16 @@ if menu == "📊 智能研报 (Google News)":
             with st.spinner(f'🔍 正在抓取 "{topic}" 的最新 Google News...'):
                 news = search_google_news(topic)
                 if "搜索失败" in news or "不可用" in news:
-                    st.warning(f"⚠️ {news} 将使用模型内部知识。")
+                    st.warning(f"⚠️ {news} 将尝试使用模型内部知识。")
                     news = None
-                
-                prompt = f"请作为资深分析师，为'{topic}'写一份研报。要求：1.核心动态 2.关键数据 3.小景建议。结合最新资讯。"
-                report = call_nvidia(prompt, MODEL_LLAMA, "你是一位顶级行业分析师。", search_context=news)
-                
-                if "❌" in report: st.error(report)
-                else:
-                    st.success("✅ 分析完成！")
-                    st.markdown(report)
-                    st.download_button("📥 下载报告", report, file_name=f"{topic}_report.md")
+                with st.spinner('🤖 正在生成研报...'):
+                    prompt = f"请作为资深分析师，为'{topic}'写一份研报。要求：1.核心动态 2.关键数据 3.小景建议。"
+                    report = call_nvidia(prompt, MODEL_LLAMA, "你是一位顶级行业分析师。", search_context=news)
+                    if "❌" in report or "⚠️" in report: st.error(report)
+                    else:
+                        st.success("✅ 分析完成！")
+                        st.markdown(report)
+                        st.download_button("📥 下载报告", report, file_name=f"{topic}_report.md")
 
 elif menu == "📝 会议纪要":
     st.header("📝 会议纪要整理助手")
@@ -124,14 +142,14 @@ elif menu == "📝 会议纪要":
             with st.spinner('🤖 正在整理...'):
                 prompt = f"请整理会议记录：1.核心决策 2.待办事项 3.潜在风险。内容：{raw_text}"
                 summary = call_nvidia(prompt, MODEL_QWEN, "你是一位高效的会议秘书。")
-                if "❌" in summary: st.error(summary)
+                if "❌" in summary or "⚠️" in summary: st.error(summary)
                 else:
                     st.success("✅ 整理完成！")
                     st.markdown(summary)
 
 elif menu == "🎨 爆款文案 (Google News)":
     st.header("🎨 爆款文案生成器")
-    st.info("💡 **已开启 Google News 实时搜索**：结合最新热点生成文案。")
+    st.info("💡 **已开启 Google News 实时搜索**")
     theme = st.text_input("请输入产品或主题")
     if st.button("✍️ 开始创作"):
         if not theme: st.warning("请输入主题！")
@@ -139,13 +157,12 @@ elif menu == "🎨 爆款文案 (Google News)":
             with st.spinner(f'🔍 正在抓取 "{theme}" 的最新热点...'):
                 news = search_google_news(theme)
                 if "搜索失败" in news or "不可用" in news:
-                    st.warning(f"⚠️ {news} 将使用模型内部知识。")
+                    st.warning(f"⚠️ {news} 将尝试使用模型内部知识。")
                     news = None
-                
-                prompt = f"请为'{theme}'写 3 个爆款文案（震惊体、专业体、亲切体）。结合最新热点。"
-                result = call_nvidia(prompt, MODEL_QWEN, "你是一位新媒体专家。", search_context=news)
-                
-                if "❌" in result: st.error(result)
-                else:
-                    st.success("✅ 创作完成！")
-                    st.markdown(result)
+                with st.spinner('🤖 正在创作...'):
+                    prompt = f"请为'{theme}'写 3 个爆款文案（震惊体、专业体、亲切体）。"
+                    result = call_nvidia(prompt, MODEL_QWEN, "你是一位新媒体专家。", search_context=news)
+                    if "❌" in result or "⚠️" in result: st.error(result)
+                    else:
+                        st.success("✅ 创作完成！")
+                        st.markdown(result)
