@@ -1,142 +1,317 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>小景智能体科技 | XiaoJing Agent Tech</title>
-    <style>
-        :root {
-            --primary: #6366f1;
-            --secondary: #a855f7;
-            --dark: #0f172a;
-            --light: #f8fafc;
-            --text: #334155;
-        }
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
-        body { background-color: var(--light); color: var(--text); line-height: 1.6; }
+import streamlit as st
+import requests
+import xml.etree.ElementTree as ET
+import time
+import pandas as pd
+import os
+from datetime import datetime
+
+# ================= 配置区域 =================
+try:
+    API_KEY = st.secrets["nvidia"]["api_key"]
+    if not API_KEY or not API_KEY.startswith("nvapi-"):
+        st.error("⚠️ API Key 格式不正确！")
+        st.stop()
+except KeyError:
+    st.error("⚠️ 未找到 API Key，请检查 Secrets。")
+    st.stop()
+
+BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+# 默认模型：70B (速度快，适合手机流式)
+MODEL_FAST = "meta/llama-3.1-70b-instruct"
+# 深度模型：405B (逻辑强，适合复杂研报)
+MODEL_STRONG = "meta/llama-3.1-405b-instruct"
+
+LOG_FILE = "usage_log.csv"
+# ==========================================
+
+# --- 初始化页面状态 ---
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'user_phone' not in st.session_state:
+    st.session_state.user_phone = ""
+if 'show_admin' not in st.session_state:
+    st.session_state.show_admin = False
+if 'model_choice' not in st.session_state:
+    st.session_state.model_choice = MODEL_FAST
+
+# --- 数据记录函数 ---
+def log_usage(feature, prompt, result):
+    data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": st.session_state.user_phone,
+        "feature": feature,
+        "prompt": prompt[:50] + "...",
+        "status": "success" if "❌" not in str(result) else "failed"
+    }
+    df = pd.DataFrame([data])
+    if not os.path.exists(LOG_FILE):
+        df.to_csv(LOG_FILE, index=False)
+    else:
+        df.to_csv(LOG_FILE, mode='a', header=False, index=False)
+
+# --- 【核心】实时价格查询 (带超时保护) ---
+def get_realtime_price(keyword):
+    coin_map = {
+        "比特币": "bitcoin", "btc": "bitcoin", "bitcoin": "bitcoin",
+        "以太坊": "ethereum", "eth": "ethereum", "ethereum": "ethereum",
+        "索拉纳": "solana", "sol": "solana",
+        "黄金": "gold", "xau": "gold"
+    }
+    coin_id = None
+    for k, v in coin_map.items():
+        if k in keyword.lower():
+            coin_id = v
+            break
+    if not coin_id:
+        return None
+    try:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd,cny"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if coin_id in data:
+                price_usd = data[coin_id]['usd']
+                price_cny = data[coin_id]['cny']
+                return f"${price_usd:,.2f} (约 ¥{price_cny:,.2f})"
+        return None
+    except:
+        return None
+
+# --- 核心函数：Google News RSS ---
+def search_google_news(query, num_results=3):
+    url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}+when:2d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    try:
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if response.status_code == 200:
+            root = ET.fromstring(response.content)
+            items = []
+            for item in root.findall('.//item'):
+                title = item.find('title').text
+                items.append(f"- **{title.split('-')[0]}**")
+                if len(items) >= num_results:
+                    break
+            return "\n".join(items) if items else "暂无新闻。"
+        else:
+            return "搜索服务暂时不可用。"
+    except Exception as e:
+        return "搜索失败。"
+
+# --- 【核心】流式调用 NVIDIA AI (带实时校准) ---
+def call_nvidia_stream(prompt, model, system_prompt="你是一个有用的助手。", search_context=None, realtime_price=None, add_insight=False):
+    # 1. 构建上下文
+    context_text = ""
+    if search_context and search_context != "未找到最新相关新闻。":
+        context_text = f"请根据以下最新资讯回答问题：{search_context}\n\n"
+    
+    # 2. 【关键】注入实时价格校准
+    price_note = ""
+    if realtime_price:
+        price_note = f"\n⚠️ **重要数据校准**：根据最新市场数据，当前实时价格为 **{realtime_price}**。请务必以此价格为准，新闻中的价格可能已过时，仅供参考！\n\n"
+    
+    final_prompt = f"{context_text}{price_note}问题：{prompt}"
+    if add_insight:
+        final_prompt += "\n\n【重要】请在回答最后，单独起一段，以 '💡 小景建议：' 开头，给出具体的行动建议或风险提示。"
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # 流式 Payload
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": final_prompt}
+        ],
+        "max_tokens": 1000,
+        "temperature": 0.7,
+        "stream": True  # 开启流式
+    }
+
+    try:
+        response = requests.post(BASE_URL, headers=headers, json=payload, stream=True, timeout=120)
+        response.raise_for_status()
         
-        /* 导航栏 */
-        nav {
-            background: rgba(255,255,255,0.9);
-            backdrop-filter: blur(10px);
-            padding: 1rem 5%;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            position: fixed;
-            width: 100%;
-            top: 0;
-            z-index: 1000;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-        }
-        .logo { display: flex; align-items: center; gap: 10px; font-weight: bold; font-size: 1.2rem; color: var(--dark); }
-        .logo img { height: 40px; }
-        .nav-links a { margin-left: 2rem; text-decoration: none; color: var(--text); font-weight: 500; transition: 0.3s; }
-        .nav-links a:hover { color: var(--primary); }
-        .btn { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: white; padding: 0.6rem 1.5rem; border-radius: 50px; text-decoration: none; transition: 0.3s; border: none; cursor: pointer; }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(99, 102, 241, 0.4); }
+        # 流式处理
+        for line in response.iter_lines():
+            if line:
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    data_str = line[6:]
+                    if data_str.strip() == '[DONE]':
+                        break
+                    try:
+                        data = eval(data_str) # 简单解析，实际可用 json.loads
+                        content = data['choices'][0]['delta'].get('content', '')
+                        if content:
+                            yield content
+                    except:
+                        continue
+    except Exception as e:
+        yield f"\n❌ 流式请求失败：{str(e)}"
 
-        /* 英雄区 */
-        header {
-            height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            background: linear-gradient(135deg, #f0f4ff 0%, #fff5ff 100%);
-            padding: 0 20px;
-        }
-        .hero-content h1 { font-size: 3.5rem; margin-bottom: 1rem; background: linear-gradient(135deg, var(--primary), var(--secondary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .hero-content p { font-size: 1.2rem; color: #64748b; margin-bottom: 2rem; max-width: 600px; margin-left: auto; margin-right: auto; }
+# --- 登录页面 ---
+def login_page():
+    st.title("📱 小景 AI")
+    st.markdown("让 AI 成为你的超级员工")
+    st.divider()
+    st.markdown("### 🔒 安全登录")
+    phone = st.text_input("请输入手机号", placeholder="138****8888")
+    code = st.text_input("请输入验证码", placeholder="输入 1234")
+    if st.button("登录/注册", use_container_width=True):
+        if code == "1234" and len(phone) > 0:
+            st.session_state.logged_in = True
+            st.session_state.user_phone = phone
+            st.rerun()
+        else:
+            st.warning("验证码错误 (试试 1234) 或手机号未填")
+
+# --- 主界面 ---
+def main_page():
+    # 侧边栏
+    with st.sidebar:
+        st.title("小景智能体")
+        st.markdown(f"👤 用户：{st.session_state.user_phone}")
+        st.divider()
         
-        /* 业务区 */
-        section { padding: 5rem 10%; }
-        .section-title { text-align: center; font-size: 2.5rem; margin-bottom: 3rem; color: var(--dark); }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2rem; }
-        .card { background: white; padding: 2rem; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); transition: 0.3s; }
-        .card:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.1); }
-        .card h3 { color: var(--primary); margin-bottom: 1rem; font-size: 1.5rem; }
+        # 模型选择
+        st.session_state.model_choice = st.radio(
+            "选择模型",
+            ["⚡ 极速模式 (70B)", "🧠 深度模式 (405B)"],
+            index=0 if st.session_state.model_choice == MODEL_FAST else 1
+        )
+        if "极速" in st.session_state.model_choice:
+            st.session_state.model_choice = MODEL_FAST
+        else:
+            st.session_state.model_choice = MODEL_STRONG
+            
+        st.divider()
+        if st.button("🔒 管理员入口"):
+            st.session_state.show_admin = True
+            st.rerun()
+        if st.button("退出登录"):
+            st.session_state.logged_in = False
+            st.rerun()
+
+    # 管理员入口
+    if st.session_state.get('show_admin', False):
+        admin_page()
+        return
+
+    # 功能逻辑
+    menu = st.radio("选择功能", ["📊 智能研报", "📝 会议纪要", "🎨 爆款文案"], index=0, label_visibility="collapsed")
+    
+    if menu == "📊 智能研报":
+        st.header("📊 智能研报")
+        st.info(f"💡 基于 **{st.session_state.model_choice}** + 实时新闻 + **实时价格校准**")
+        topic = st.text_input("行业或主题 (例如：比特币、英伟达、黄金)")
         
-        /* 页脚 */
-        footer { background: var(--dark); color: white; text-align: center; padding: 2rem; }
-        
-        /* 动画 */
-        @keyframes float { 0% { transform: translateY(0px); } 50% { transform: translateY(-10px); } 100% { transform: translateY(0px); } }
-        .floating { animation: float 3s ease-in-out infinite; }
-    </style>
-</head>
-<body>
+        if st.button("🚀 生成研报"):
+            if not topic:
+                st.warning("请输入主题")
+            else:
+                # 占位符用于显示进度
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                result_container = st.empty() # 用于流式输出
+                
+                # 步骤 1: 查价格
+                status_text.text("⏳ 正在获取实时行情...")
+                realtime_price = get_realtime_price(topic)
+                if realtime_price:
+                    st.success(f"✅ 获取到最新行情：{topic} 当前价格为 **{realtime_price}**")
+                else:
+                    st.info("ℹ️ 未检测到特定行情数据，将仅依赖新闻分析。")
+                progress_bar.progress(33)
+                
+                # 步骤 2: 搜新闻
+                status_text.text("⏳ 正在搜索最新新闻...")
+                time.sleep(0.5)
+                news = search_google_news(topic)
+                if "失败" in news or "不可用" in news:
+                    st.warning(news)
+                progress_bar.progress(66)
+                
+                # 步骤 3: 流式生成报告
+                status_text.text("🤖 正在深度分析并撰写报告 (流式输出中...)")
+                prompt = f"为'{topic}'写一份简短研报。1.核心动态 2.关键数据 3.建议。"
+                
+                # 调用流式函数
+                full_response = ""
+                try:
+                    for chunk in call_nvidia_stream(prompt, st.session_state.model_choice, search_context=news, realtime_price=realtime_price, add_insight=True):
+                        full_response += chunk
+                        result_container.markdown(full_response + "▌") # 添加光标效果
+                    result_container.markdown(full_response) # 去掉光标
+                    status_text.text("")
+                    progress_bar.progress(100)
+                    log_usage("研报", topic, full_response)
+                except Exception as e:
+                    result_container.error(f"❌ 生成失败：{str(e)}")
+                    status_text.text("")
 
-    <!-- 导航栏 -->
-    <nav>
-        <div class="logo">
-            <img src="logo.svg" alt="Logo">
-            <span>小景智能体科技</span>
-        </div>
-        <div class="nav-links">
-            <a href="#services">核心业务</a>
-            <a href="#about">关于我们</a>
-            <a href="#contact" class="btn">立即咨询</a>
-        </div>
-    </nav>
+    elif menu == "📝 会议纪要":
+        st.header("📝 会议纪要")
+        raw_text = st.text_area("粘贴会议记录", height=150)
+        if st.button("🪄 一键整理"):
+            if not raw_text:
+                st.warning("请输入内容")
+            else:
+                with st.spinner('🤖 正在整理...'):
+                    prompt = f"整理会议记录：1.核心决策 2.待办 3.风险。内容：{raw_text}"
+                    # 会议纪要不需要流式，直接出结果
+                    summary = call_nvidia_stream(prompt, MODEL_FAST)
+                    full_summary = "".join(summary) # 收集所有块
+                    if "❌" in full_summary:
+                        st.error(full_summary)
+                    else:
+                        st.success("✅ 完成")
+                        st.markdown(full_summary)
+                        log_usage("纪要", raw_text[:50], full_summary)
 
-    <!-- 首页英雄区 -->
-    <header>
-        <div class="hero-content">
-            <h1 class="floating">让 AI 成为你的超级员工</h1>
-            <p>小景智能体科技，专注于为企业提供定制化 AI Agent 解决方案。从自动化研报到数字人员工，我们重新定义生产力。</p>
-            <a href="#contact" class="btn" style="font-size: 1.2rem; padding: 1rem 2.5rem;">开启智能未来</a>
-        </div>
-    </header>
+    elif menu == "🎨 爆款文案":
+        st.header("🎨 爆款文案")
+        theme = st.text_input("产品或主题")
+        if st.button("✍️ 创作"):
+            if not theme:
+                st.warning("请输入主题")
+            else:
+                with st.spinner('🤖 正在创作...'):
+                    prompt = f"为'{theme}'写 3 个爆款文案（震惊体、专业体、亲切体）。"
+                    result = call_nvidia_stream(prompt, MODEL_FAST)
+                    full_result = "".join(result)
+                    if "❌" in full_result:
+                        st.error(full_result)
+                    else:
+                        st.success("✅ 完成")
+                        st.markdown(full_result)
+                        log_usage("文案", theme, full_result)
 
-    <!-- 核心业务 -->
-    <section id="services">
-        <h2 class="section-title">我们能为你做什么？</h2>
-        <div class="grid">
-            <div class="card">
-                <h3>📊 智能研报生成</h3>
-                <p>7x24 小时监控全网资讯，自动生成深度行业研报。让决策快人一步，效率提升 10 倍。</p>
-            </div>
-            <div class="card">
-                <h3>🤖 企业数字员工</h3>
-                <p>定制专属 AI Agent，处理客服、销售、行政等重复性工作。一人抵三人，全年无休。</p>
-            </div>
-            <div class="card">
-                <h3>🎨 自动化内容矩阵</h3>
-                <p>从文案撰写到视频生成，全自动运营小红书/抖音/公众号。打造爆款，从未如此简单。</p>
-            </div>
-        </div>
-    </section>
+# --- 管理员页面 ---
+def admin_page():
+    st.header("📊 数据驾驶舱")
+    st.markdown(f"当前管理员：**{st.session_state.user_phone}**")
+    if st.button("返回主页"):
+        st.session_state.show_admin = False
+        st.rerun()
+    st.divider()
+    if os.path.exists(LOG_FILE):
+        df = pd.read_csv(LOG_FILE)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("总调用次数", len(df))
+        with col2:
+            today = datetime.now().strftime("%Y-%m-%d")
+            st.metric("今日调用", len(df[df['timestamp'].str.contains(today)]))
+        st.write("### 最近记录")
+        st.dataframe(df.tail(10).sort_values(by="timestamp", ascending=False))
+    else:
+        st.info("暂无数据")
 
-    <!-- 关于我们 -->
-    <section id="about" style="background: white;">
-        <h2 class="section-title">关于小景智能体</h2>
-        <div style="text-align: center; max-width: 800px; margin: 0 auto;">
-            <p style="font-size: 1.1rem; margin-bottom: 1rem;">
-                我们是一家由人类 CEO 与超级 AI 共同驱动的科技公司。
-            </p>
-            <p style="color: #64748b;">
-                创始人坚信，未来的公司形态将是“人机协作”。小景智能体科技致力于探索这一边界，通过自主研发的 Agent 框架，将人类从繁琐的重复劳动中解放出来，去从事更具创造力的工作。
-            </p>
-        </div>
-    </section>
-
-    <!-- 页脚 -->
-    <footer id="contact">
-        <h2>准备好拥抱 AI 了吗？</h2>
-        <p style="margin: 1rem 0;">联系我们，获取您的专属 AI 转型方案</p>
-        <p>📧 contact@xiaojing.ai | 📱 138-xxxx-xxxx</p>
-        <p style="margin-top: 2rem; font-size: 0.8rem; opacity: 0.7;">© 2026 小景智能体科技 版权所有</p>
-    </footer>
-
-    <script>
-        // 简单的平滑滚动
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function (e) {
-                e.preventDefault();
-                document.querySelector(this.getAttribute('href')).scrollIntoView({ behavior: 'smooth' });
-            });
-        });
-    </script>
-</body>
-</html>
+# --- 主逻辑 ---
+if not st.session_state.logged_in:
+    login_page()
+else:
+    main_page()
